@@ -25,11 +25,8 @@ MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "4")))
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 SCREENSHOT_ON_ERROR = os.getenv("SCREENSHOT_ON_ERROR", "false").lower() == "true"
 
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-ALERT_TO = os.getenv("ALERT_TO", SMTP_USER)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 runtime = {
     "playwright": None,
@@ -312,18 +309,21 @@ async def check_course(course, browser, semaphore):
             await context.close()
 
 
-def send_email_sync(subject, body):
-    if not (SMTP_USER and SMTP_PASSWORD and ALERT_TO):
-        print("Email not configured; alert suppressed.", flush=True)
+def send_telegram_sync(text):
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("Telegram not configured; alert suppressed.", flush=True)
         return
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USER
-    msg["To"] = ALERT_TO
-    msg.set_content(body)
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
-        smtp.login(SMTP_USER, SMTP_PASSWORD)
-        smtp.send_message(msg)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": "true",
+    }).encode()
+    req = urllib.request.Request(url, data=payload, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode())
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram send failed: {data}")
 
 
 async def save_result_and_maybe_alert(course, result):
@@ -359,13 +359,13 @@ async def save_result_and_maybe_alert(course, result):
             f"Detected: {checked}{reserve_note}\n\nOpen Quest and enrol immediately."
         )
         try:
-            await asyncio.to_thread(send_email_sync, f"🚨 UW seat alert: {course['subject']} {course['course']} — {seats} available", body)
+            await asyncio.to_thread(send_telegram_sync, f"🚨 UW seat alert: {course['subject']} {course['course']} — {seats} available\n\n{body}")
             with db_conn() as conn:
                 conn.execute("UPDATE courses SET last_alerted_seats=? WHERE id=?", (seats, course["id"]))
                 conn.commit()
             print(f"ALERT SENT: {course['subject']} {course['course']} ({seats} seats)", flush=True)
         except Exception as exc:
-            print(f"Email alert failed: {exc}", flush=True)
+            print(f"Telegram alert failed: {exc}", flush=True)
 
 
 async def mark_error(course_id, message):
@@ -487,9 +487,9 @@ async def dashboard():
     if not table_rows:
         table_rows = "<tr><td colspan='7' class='muted'>No courses yet. Add one below.</td></tr>"
 
-    email_state = "configured" if (SMTP_USER and SMTP_PASSWORD and ALERT_TO) else "not configured"
+    telegram_state = "configured" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "not configured"
     body = f"""<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>{CSS}<meta http-equiv='refresh' content='20'></head><body><div class='wrap'>
-      <div class='top'><div><h1>UW Course Watcher</h1><div class='muted'>Parallel Quest checks every {CHECK_SECONDS}s · concurrency {MAX_CONCURRENCY} · email {email_state}</div></div>
+      <div class='top'><div><h1>UW Course Watcher</h1><div class='muted'>Parallel Quest checks every {CHECK_SECONDS}s · concurrency {MAX_CONCURRENCY} · Telegram {telegram_state}</div></div>
       <div class='muted'>Cycle: {esc(runtime['last_cycle_started'] or 'starting…')}</div></div>
       <div class='card'><table><thead><tr><th>Course</th><th>Class / section</th><th>Status</th><th>Enrolled / cap</th><th>Reserve</th><th>Last checked</th><th></th></tr></thead><tbody>{table_rows}</tbody></table></div>
       <div class='card'><h2 style='margin-top:0'>Add course</h2>
