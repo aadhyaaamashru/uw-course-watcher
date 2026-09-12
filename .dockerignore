@@ -1,9 +1,7 @@
-.env
+.git
 .venv
 __pycache__
 *.pyc
-state.json
-error.png
-error.txt
-.git
-.gitignore
+.env
+*.db
+/data

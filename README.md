@@ -1,135 +1,58 @@
-# UW Quest Multi-Course Watcher
+# UW Course Watcher — final UI version
 
-A small 24/7 web app that watches multiple University of Waterloo courses in **public Quest Class Search** and Telegrams you when a seat appears.
+A small Railway-hosted app that watches exact University of Waterloo Quest class numbers and sends a Telegram push when a **Regular** section is **Open**.
 
-## What changed in this version
+## How it works
 
-- Add/remove courses from a simple browser UI — no `.env` editing per course.
-- Watch any number of courses.
-- Checks courses **in parallel**.
-- Uses fixed polling cycles: approximately `00:00`, `01:00`, `02:00` when `CHECK_SECONDS=60`, rather than waiting 60 seconds *after* the previous scrape finishes.
-- Stores courses and previous seat counts in SQLite so cloud restarts do not erase your watch list.
-- Pause/resume individual courses.
-- Shows last seat count, enrolment/capacity, reserve indicator, check time, and scrape errors.
-- Sends Telegram only when availability appears or increases, not every minute.
+- Add `Subject + Course + exact Class #` from the web dashboard.
+- Targets are stored in SQLite at `/data/watcher.db`.
+- Distinct courses are spread evenly across a 60-second cycle.
+- One persistent Quest guest cookie session handles up to 10 distinct courses.
+- 11–20 distinct courses automatically use 2 Quest guest sessions, 21–30 use 3, etc.
+- Multiple class numbers under the same course use one Quest search.
+- If a target is Open on the very first check, Telegram alerts immediately.
+- It does not ping every minute while the same class stays Open. A Closed result re-arms the alert so a later Open state can notify again.
 
-## Parallel behavior
-
-With `MAX_CONCURRENCY=4` and four courses:
-
-```text
-0:00  CS 349 ─┐
-      CS 346 ─┼── all start together
-      BET 430 ┤
-      STAT 331┘
-
-1:00  all four start together again
-2:00  all four start together again
-```
-
-If you watch 10 courses with a concurrency of 4, they run in parallel batches of up to four. This avoids opening too many Quest sessions simultaneously.
-
-## Run locally
-
-```bash
-cp .env.example .env
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-uvicorn app:app --host 0.0.0.0 --port 8080
-```
-
-Open:
-
-```text
-http://localhost:8080
-```
-
-Then use **Add course** in the dashboard.
-
-For each watch, enter:
-
-- Term, e.g. `Fall 2026`
-- Subject, e.g. `CS`
-- Course, e.g. `349`
-- **Class Number** — recommended because it uniquely identifies the class
-- Section — optional alternative if you do not know the class number
-- Career — normally `Undergraduate`
-
-## Telegram setup
-
-Put these in `.env` locally or in your cloud provider's environment variables:
-
-```env
-TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
-TELEGRAM_CHAT_ID=your_numeric_chat_id
-```
-
-For Gmail, use a **Google App Password**, not your normal Gmail password.
-
-If Telegram settings are omitted, the dashboard/checker still runs but alerts are only visible in logs/UI.
-
-## Polling settings
+## Railway variables
 
 ```env
 CHECK_SECONDS=60
-MAX_CONCURRENCY=4
+COURSES_PER_SESSION=10
+REQUEST_TIMEOUT=20
+DEFAULT_TERM_CODE=1269
+DB_PATH=/data/watcher.db
+
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=choose-a-password
 ```
 
-`CHECK_SECONDS` has a safety floor of 30 seconds in the code. A 60-second interval is recommended.
+`DASHBOARD_PASSWORD` is recommended because the Railway domain is public. If omitted, the UI has no authentication.
 
-`MAX_CONCURRENCY=4` means at most four Quest browser contexts run at once. You can increase it, but keeping it modest is friendlier to Quest and uses less RAM.
+## Railway volume
 
-## Docker
-
-```bash
-docker compose up -d --build
-```
-
-Then open:
+Attach a persistent volume mounted at:
 
 ```text
-http://localhost:8080
+/data
 ```
 
-The Docker volume stores `/data/watcher.db`, so your course list/state survives container restarts.
+This keeps your UI-added class numbers and alert state across restarts/redeploys.
 
-## Railway deployment
+## Railway domain
 
-1. Put this folder in a GitHub repository.
-2. Create a Railway project from the repository.
-3. Railway detects the included `Dockerfile`.
-4. Add the environment variables from `.env.example` in Railway Variables.
-5. Add a Railway persistent volume mounted at `/data`.
-6. Deploy.
-7. In Railway networking/settings, generate a public domain for the service.
-8. Open that domain from your phone or computer to add/remove courses.
+Because this final version has a web UI, enable Railway **Public Networking** and generate a domain. Open that URL to add/pause/delete exact class numbers.
 
-The app listens on Railway's `PORT` automatically and exposes `/health` for the included Railway health check.
+## Update the existing repo
 
-## Data stored
+From the existing local repo, copy these files over the repo root and push:
 
-The SQLite database at `/data/watcher.db` stores:
+```bash
+git add .
+git commit -m "Final direct Quest watcher UI"
+git push
+```
 
-- your watched course identifiers
-- enabled/paused state
-- last seat count
-- capacity/enrolment
-- last check/error
-- last alert seat count
-
-It does **not** store your Waterloo username or password. The watcher uses public Quest Class Search.
-
-## Reserve capacity
-
-Quest can show available seats that are reserved for particular student groups. The watcher displays whether reserve capacity was detected and includes a warning in the alert. It cannot know whether *you personally* satisfy a reserve requirement, so confirm that in Quest before enrolling.
-
-## Files
-
-- `app.py` — dashboard + SQLite + parallel Quest worker + Telegram alerts
-- `Dockerfile` — cloud container
-- `docker-compose.yml` — local/VPS continuous deployment
-- `railway.toml` — Railway health/restart config
-- `.env.example` — runtime/Telegram settings
-- `requirements.txt` — Python dependencies
+Railway should redeploy the same service automatically.

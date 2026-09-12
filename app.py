@@ -1,676 +1,599 @@
+import base64
+import math
 import os
 import re
-import asyncio
+import secrets
 import sqlite3
-import smtplib
-import html
-import json
-import urllib.parse
-import urllib.request
-from contextlib import asynccontextmanager
-from datetime import datetime
-from email.message import EmailMessage
+import threading
+import time
+from collections import OrderedDict
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from html import escape
 from pathlib import Path
-from time import monotonic
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
-from playwright.async_api import async_playwright
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 
-load_dotenv()
+SEARCH_PAGE = (
+    "https://quest.pecs.uwaterloo.ca/psc/PB/ACADEMIC/SA/c/"
+    "UW_PUBLIC_ACCESS.UW_CLASS_SRCH.GBL"
+    "?NavColl=true&ICAGTarget=start"
+)
+POST_URL = (
+    "https://quest.pecs.uwaterloo.ca/psc/PB/ACADEMIC/SA/c/"
+    "UW_PUBLIC_ACCESS.UW_CLASS_SRCH.GBL"
+)
+QUEST_HOME = "https://quest.pecs.uwaterloo.ca/"
 
-HELP_URL = "https://uwaterloo.ca/the-centre/quest/quest-help/how-do-i-search-class"
-DB_PATH = Path(os.getenv("DB_PATH", "/data/watcher.db"))
-DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 CHECK_SECONDS = max(30, int(os.getenv("CHECK_SECONDS", "60")))
-MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "4")))
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-SCREENSHOT_ON_ERROR = os.getenv("SCREENSHOT_ON_ERROR", "false").lower() == "true"
+COURSES_PER_SESSION = max(1, int(os.getenv("COURSES_PER_SESSION", "10")))
+REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "20")))
+DEFAULT_TERM_CODE = os.getenv("DEFAULT_TERM_CODE", "1269").strip() or "1269"
+DB_PATH = Path(os.getenv("DB_PATH", "/data/watcher.db"))
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "admin").strip() or "admin"
 
-runtime = {
-    "playwright": None,
-    "browser": None,
-    "worker": None,
-    "last_cycle_started": None,
-    "last_cycle_finished": None,
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153 Safari/537.36"
+)
 
-
-def db_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with db_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS courses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                term TEXT NOT NULL,
-                subject TEXT NOT NULL,
-                course TEXT NOT NULL,
-                class_number TEXT DEFAULT '',
-                section TEXT DEFAULT '',
-                career TEXT DEFAULT 'Undergraduate',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                available_seats INTEGER,
-                capacity INTEGER,
-                enrolled INTEGER,
-                quest_status TEXT,
-                reserve_present INTEGER,
-                last_checked TEXT,
-                last_error TEXT,
-                last_alerted_seats INTEGER,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
+app = FastAPI(title="UW Course Watcher")
+stop_event = threading.Event()
+scheduler_thread: threading.Thread | None = None
+quest_sessions: list[requests.Session] = []
+quest_sessions_lock = threading.Lock()
 
 
-def now_str():
-    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+def now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def normalize(value):
-    return re.sub(r"\s+", " ", value or " ").strip()
+def log(msg: str) -> None:
+    print(f"[{now_utc()}] {msg}", flush=True)
 
 
-async def first_visible(locator):
+def _authorized(request: Request) -> bool:
+    if not DASHBOARD_PASSWORD:
+        return True
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Basic "):
+        return False
     try:
-        count = await locator.count()
+        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+        username, password = decoded.split(":", 1)
+        return secrets.compare_digest(username, DASHBOARD_USERNAME) and secrets.compare_digest(
+            password, DASHBOARD_PASSWORD
+        )
     except Exception:
-        return None
-    for i in range(count):
-        item = locator.nth(i)
-        try:
-            if await item.is_visible():
-                return item
-        except Exception:
-            pass
-    return None
-
-
-async def find_input(root, label_patterns):
-    for pat in label_patterns:
-        try:
-            loc = root.get_by_label(re.compile(pat, re.I))
-            item = await first_visible(loc)
-            if item:
-                return item
-        except Exception:
-            pass
-
-    try:
-        labels = root.locator("label")
-        count = await labels.count()
-    except Exception:
-        return None
-    for i in range(count):
-        lab = labels.nth(i)
-        try:
-            txt = normalize(await lab.inner_text())
-        except Exception:
-            continue
-        if any(re.search(p, txt, re.I) for p in label_patterns):
-            target = await lab.get_attribute("for")
-            if target:
-                cand = root.locator(f"#{target}")
-                try:
-                    if await cand.count() and await cand.first.is_visible():
-                        return cand.first
-                except Exception:
-                    pass
-    return None
-
-
-async def set_field(root, patterns, value):
-    field = await find_input(root, patterns)
-    if not field:
         return False
-    tag = await field.evaluate("el => el.tagName.toLowerCase()")
-    if tag == "select":
-        options = field.locator("option")
-        wanted = value.strip().lower()
-        for i in range(await options.count()):
-            opt = options.nth(i)
-            label = normalize(await opt.inner_text())
-            opt_value = (await opt.get_attribute("value") or "").strip()
-            if label.lower() == wanted or opt_value.lower() == wanted or label.lower().startswith(wanted):
-                await field.select_option(index=i)
-                return True
-        return False
-    else:
-        await field.fill(value)
-    return True
 
 
-async def choose_term(root, term):
-    field = await find_input(root, [r"^Term$", r"Academic Term", r"Term"])
-    if not field:
-        return False
-    tag = await field.evaluate("el => el.tagName.toLowerCase()")
-    if tag != "select":
-        return False
-    options = field.locator("option")
-    for i in range(await options.count()):
-        opt = options.nth(i)
-        txt = normalize(await opt.inner_text())
-        if term.lower() in txt.lower():
-            await field.select_option(index=i)
-            return True
-    return False
-
-
-async def enter_public_quest(page):
-    await page.goto(HELP_URL, wait_until="domcontentloaded", timeout=60_000)
-    public_link = page.get_by_role("link", name=re.compile(r"Quest Class Search page from this link", re.I))
-    if not await public_link.count():
-        public_link = page.locator('a[href*="quest.pecs.uwaterloo.ca"]').last
-    href = await public_link.get_attribute("href")
-    if not href:
-        raise RuntimeError("Could not find the public Quest Class Search URL.")
-    await page.goto(href, wait_until="domcontentloaded", timeout=60_000)
-    await page.wait_for_timeout(1800)
-    text = normalize(await page.locator("body").inner_text())
-    if "User ID" in text and "Password" in text and "Class Search" not in text:
-        raise RuntimeError("Quest redirected the public browser session to sign-in.")
-
-
-async def dump_quest_diagnostics(page, course):
-    print(f"\n=== QUEST DIAGNOSTICS: {course['subject']} {course['course']} ===", flush=True)
-    try:
-        print(f"PAGE URL: {page.url}", flush=True)
-        print(f"PAGE TITLE: {await page.title()}", flush=True)
-    except Exception as exc:
-        print(f"PAGE META ERROR: {exc}", flush=True)
-
-    frames = page.frames
-    print(f"FRAME COUNT: {len(frames)}", flush=True)
-    for idx, frame in enumerate(frames):
-        try:
-            print(f"FRAME[{idx}] name={frame.name!r} url={frame.url}", flush=True)
-            inputs = frame.locator("input, select, textarea, button")
-            count = min(await inputs.count(), 120)
-            print(f"FRAME[{idx}] controls={count}", flush=True)
-            for i in range(count):
-                el = inputs.nth(i)
-                try:
-                    info = await el.evaluate("""el => ({
-                        tag: el.tagName,
-                        type: el.getAttribute('type'),
-                        id: el.id,
-                        name: el.getAttribute('name'),
-                        value: el.value,
-                        placeholder: el.getAttribute('placeholder'),
-                        aria: el.getAttribute('aria-label'),
-                        title: el.getAttribute('title'),
-                        text: (el.innerText || '').trim().slice(0,120),
-                        visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-                    })""")
-                    print(f"  CONTROL[{i}] {info}", flush=True)
-                except Exception as exc:
-                    print(f"  CONTROL[{i}] <inspect error: {exc}>", flush=True)
-
-            labels = frame.locator("label")
-            lcount = min(await labels.count(), 80)
-            for i in range(lcount):
-                lab = labels.nth(i)
-                try:
-                    txt = normalize(await lab.inner_text())
-                    target = await lab.get_attribute("for")
-                    if txt:
-                        print(f"  LABEL[{i}] text={txt!r} for={target!r}", flush=True)
-                except Exception:
-                    pass
-
-            body_text = normalize(await frame.locator("body").inner_text(timeout=3000))
-            print(f"FRAME[{idx}] BODY PREVIEW: {body_text[:2500]}", flush=True)
-        except Exception as exc:
-            print(f"FRAME[{idx}] INSPECTION ERROR: {exc}", flush=True)
-
-    print("=== END QUEST DIAGNOSTICS ===\n", flush=True)
-
-
-async def get_quest_search_frame(page):
-    """Return the stable PeopleSoft main frame used for both search and results."""
-    # The live Quest diagnostics showed the public search/results content in this frame.
-    for frame in page.frames:
-        if frame.name == "main_target_win0":
-            return frame
-
-    # Fallback to the Waterloo public class-search component URL.
-    for frame in page.frames:
-        if "UW_CLASS_SRCH.GBL" in frame.url:
-            return frame
-
-    # Last fallback: find the frame containing the actual Subject control.
-    for frame in page.frames:
-        try:
-            if await frame.locator('[id="SSR_CLSRCH_WRK_SUBJECT$0"]').count():
-                return frame
-        except Exception:
-            pass
-    return None
-
-
-async def select_option_by_text(locator, wanted):
-    wanted = wanted.strip().lower()
-    options = locator.locator("option")
-    for i in range(await options.count()):
-        opt = options.nth(i)
-        txt = normalize(await opt.inner_text())
-        # PeopleSoft sometimes includes bidi control characters in option labels.
-        txt_clean = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", txt).strip()
-        if wanted == txt_clean.lower() or wanted in txt_clean.lower():
-            await locator.select_option(index=i)
-            return True
-    return False
-
-
-async def perform_search(page, course):
-    root = await get_quest_search_frame(page)
-    if root is None:
-        await dump_quest_diagnostics(page, course)
-        raise RuntimeError("Could not find the Quest class-search frame.")
-
-    # Use the exact PeopleSoft controls observed on Waterloo's live public Quest page.
-    term = root.locator('[id="CLASS_SRCH_WRK2_STRM$35$"]')
-    subject = root.locator('[id="SSR_CLSRCH_WRK_SUBJECT$0"]')
-    match_mode = root.locator('[id="SSR_CLSRCH_WRK_SSR_EXACT_MATCH1$1"]')
-    catalog = root.locator('[id="SSR_CLSRCH_WRK_CATALOG_NBR$1"]')
-    career = root.locator('[id="SSR_CLSRCH_WRK_ACAD_CAREER$2"]')
-    open_only = root.locator('[id="SSR_CLSRCH_WRK_SSR_OPEN_ONLY$3"]')
-    search_btn = root.locator('#CLASS_SRCH_WRK2_SSR_PB_CLASS_SRCH')
-
-    if not await term.count() or not await subject.count() or not await catalog.count():
-        await dump_quest_diagnostics(page, course)
-        raise RuntimeError("Quest search controls were not found in the expected frame.")
-
-    if not await select_option_by_text(term, course["term"]):
-        raise RuntimeError(f"Could not select term {course['term']!r} in Quest.")
-
-    await subject.fill(course["subject"])
-
-    # Force an exact course-number match, then fill the *actual* catalog-number input.
-    # The visible 'Course Number' label points at the comparator select, not this input,
-    # which is why the previous generic label-based code failed.
-    if await match_mode.count():
-        try:
-            await match_mode.select_option(label="is exactly")
-        except Exception:
-            await select_option_by_text(match_mode, "is exactly")
-    await catalog.fill(course["course"])
-
-    if await career.count():
-        if not await select_option_by_text(career, course["career"]):
-            # Career is useful but not required to submit the search.
-            print(f"Warning: could not select career {course['career']!r}; continuing.", flush=True)
-
-    if await open_only.count():
-        try:
-            if await open_only.is_checked():
-                await open_only.uncheck()
-        except Exception:
-            pass
-
-    if not await search_btn.count():
-        raise RuntimeError("Could not find Quest Search button.")
-
-    before_text = normalize(await root.locator("body").inner_text())
-    await search_btn.click()
-
-    # PeopleSoft posts back inside main_target_win0. Wait for the frame body to actually
-    # change rather than sleeping a fixed amount and assuming results are ready.
-    result_root = await get_quest_search_frame(page) or root
-    for _ in range(30):  # up to ~15 seconds
-        await page.wait_for_timeout(500)
-        try:
-            current = normalize(await result_root.locator("body").inner_text())
-        except Exception:
-            result_root = await get_quest_search_frame(page) or root
-            continue
-        if current and current != before_text and len(current) > 80:
-            break
-
-    return await get_quest_search_frame(page) or result_root
-
-
-async def open_target_class(root, course):
-    body_text = normalize(await root.locator("body").inner_text())
-
-    # Prefer the exact class number/section supplied by the user. Quest result pages do
-    # not always repeat the subject + catalog number as one literal string, so rejecting
-    # the page based on that text caused false failures.
-    if course["class_number"]:
-        links = root.get_by_role("link", name=re.compile(rf"\b{re.escape(course['class_number'])}\b"))
-        item = await first_visible(links)
-        if item:
-            await item.click()
-            await root.wait_for_timeout(1400)
-            return
-
-    if course["section"]:
-        item = await first_visible(root.get_by_text(re.compile(re.escape(course["section"]), re.I)))
-        if item:
-            try:
-                await item.click()
-                await root.wait_for_timeout(1400)
-                return
-            except Exception:
-                pass
-
-    # Only allow first-match fallback when no section/class was specified.
-    if not course["class_number"] and not course["section"]:
-        links = root.locator("a")
-        for i in range(await links.count()):
-            a = links.nth(i)
-            try:
-                txt = normalize(await a.inner_text())
-                if re.fullmatch(r"\d{4,5}(?:\s+.*)?", txt):
-                    await a.click()
-                    await root.wait_for_timeout(1400)
-                    return
-            except Exception:
-                pass
-    else:
-        raise RuntimeError("Target class number/section was not found in search results.")
-
-
-def extract_number(text, label):
-    patterns = [rf"{label}\s*[:\-]?\s*(\d+)", rf"{label}\s+[^\d]{{0,20}}(\d+)"]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.I)
-        if m:
-            return int(m.group(1))
-    return None
-
-
-async def parse_availability(root):
-    text = normalize(await root.locator("body").inner_text())
-    capacity = extract_number(text, r"Class Capacity")
-    enrolled = extract_number(text, r"Enrollment Total")
-    available = extract_number(text, r"Available Seats")
-    if available is None and capacity is not None and enrolled is not None:
-        available = capacity - enrolled
-    if available is None:
-        raise RuntimeError("Could not parse Available Seats from Quest.")
-
-    status = None
-    if re.search(r"\bStatus\b.{0,40}\bOpen\b", text, re.I):
-        status = "Open"
-    elif re.search(r"\bStatus\b.{0,40}\bClosed\b", text, re.I):
-        status = "Closed"
-    reserve_present = bool(re.search(r"Reserve Capacity", text, re.I))
-    return {
-        "capacity": capacity,
-        "enrolled": enrolled,
-        "available_seats": available,
-        "status": status,
-        "reserve_present": reserve_present,
-    }
-
-
-async def check_course(course, browser, semaphore):
-    async with semaphore:
-        context = await browser.new_context(viewport={"width": 1440, "height": 1000})
-        page = await context.new_page()
-        try:
-            await enter_public_quest(page)
-            root = await perform_search(page, course)
-            await open_target_class(root, course)
-            return await parse_availability(root)
-        except Exception:
-            if SCREENSHOT_ON_ERROR:
-                try:
-                    shot = f"/data/error-course-{course['id']}.png"
-                    await page.screenshot(path=shot, full_page=True)
-                    print(f"Saved Quest error screenshot: {shot}", flush=True)
-                except Exception as shot_exc:
-                    print(f"Could not save Quest error screenshot: {shot_exc}", flush=True)
-            raise
-        finally:
-            await context.close()
-
-
-def send_telegram_sync(text):
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        print("Telegram not configured; alert suppressed.", flush=True)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": "true",
-    }).encode()
-    req = urllib.request.Request(url, data=payload, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        data = json.loads(resp.read().decode())
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram send failed: {data}")
-
-
-async def save_result_and_maybe_alert(course, result):
-    checked = now_str()
-    seats = result["available_seats"]
-    previous = course["available_seats"]
-    last_alerted = course["last_alerted_seats"]
-
-    should_alert = seats > 0 and (
-        previous is None or previous <= 0 or (seats > previous and (last_alerted is None or seats > last_alerted))
+@app.middleware("http")
+async def dashboard_auth(request: Request, call_next):
+    if request.url.path == "/health" or _authorized(request):
+        return await call_next(request)
+    return PlainTextResponse(
+        "Authentication required",
+        status_code=401,
+        headers={"WWW-Authenticate": 'Basic realm="UW Course Watcher"'},
     )
 
-    with db_conn() as conn:
+
+def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
-            """UPDATE courses SET available_seats=?, capacity=?, enrolled=?, quest_status=?,
-               reserve_present=?, last_checked=?, last_error=NULL WHERE id=?""",
-            (seats, result["capacity"], result["enrolled"], result["status"], int(result["reserve_present"]), checked, course["id"]),
+            """
+            CREATE TABLE IF NOT EXISTS watch_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                term_code TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                course TEXT NOT NULL,
+                class_number TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_status TEXT,
+                last_section TEXT,
+                last_checked_at TEXT,
+                alerted_open INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(term_code, subject, course, class_number)
+            )
+            """
         )
         conn.commit()
 
-    if should_alert:
-        reserve_note = (
-            "\nWARNING: Quest shows reserve capacity. Confirm that the available seat is available to your student group."
-            if result["reserve_present"] else ""
-        )
-        target = course["class_number"] or course["section"] or "first matching class"
-        body = (
-            f"Quest Class Search shows an opening.\n\n"
-            f"Course: {course['subject']} {course['course']}\n"
-            f"Term: {course['term']}\nTarget: {target}\n"
-            f"Available Seats: {seats}\nEnrollment Total: {result['enrolled']}\n"
-            f"Class Capacity: {result['capacity']}\nQuest status: {result['status']}\n"
-            f"Detected: {checked}{reserve_note}\n\nOpen Quest and enrol immediately."
-        )
-        try:
-            await asyncio.to_thread(send_telegram_sync, f"🚨 UW seat alert: {course['subject']} {course['course']} — {seats} available\n\n{body}")
-            with db_conn() as conn:
-                conn.execute("UPDATE courses SET last_alerted_seats=? WHERE id=?", (seats, course["id"]))
-                conn.commit()
-            print(f"ALERT SENT: {course['subject']} {course['course']} ({seats} seats)", flush=True)
-        except Exception as exc:
-            print(f"Telegram alert failed: {exc}", flush=True)
 
-
-async def mark_error(course_id, message):
-    with db_conn() as conn:
-        conn.execute("UPDATE courses SET last_checked=?, last_error=? WHERE id=?", (now_str(), str(message)[:800], course_id))
-        conn.commit()
-
-
-async def run_cycle():
-    runtime["last_cycle_started"] = now_str()
-    with db_conn() as conn:
-        courses = [dict(r) for r in conn.execute("SELECT * FROM courses WHERE enabled=1 ORDER BY id").fetchall()]
-
-    if not courses:
-        runtime["last_cycle_finished"] = now_str()
-        return
-
-    semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
-
-    async def one(course):
-        label = f"{course['subject']} {course['course']}"
-        try:
-            result = await check_course(course, runtime["browser"], semaphore)
-            await save_result_and_maybe_alert(course, result)
-            print(f"[{now_str()}] {label}: {result['available_seats']} available", flush=True)
-        except Exception as exc:
-            await mark_error(course["id"], exc)
-            print(f"[{now_str()}] {label}: ERROR {exc}", flush=True)
-
-    await asyncio.gather(*(one(c) for c in courses))
-    runtime["last_cycle_finished"] = now_str()
-
-
-async def watcher_loop():
-    while True:
-        started = monotonic()
-        try:
-            await run_cycle()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            print(f"Watcher cycle failed: {exc}", flush=True)
-        elapsed = monotonic() - started
-        await asyncio.sleep(max(0.0, CHECK_SECONDS - elapsed))
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    runtime["playwright"] = await async_playwright().start()
-    runtime["browser"] = await runtime["playwright"].chromium.launch(headless=HEADLESS)
-    runtime["worker"] = asyncio.create_task(watcher_loop())
+@contextmanager
+def db_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
     try:
-        yield
+        yield conn
     finally:
-        if runtime["worker"]:
-            runtime["worker"].cancel()
-            try:
-                await runtime["worker"]
-            except asyncio.CancelledError:
-                pass
-        if runtime["browser"]:
-            await runtime["browser"].close()
-        if runtime["playwright"]:
-            await runtime["playwright"].stop()
+        conn.close()
 
 
-app = FastAPI(lifespan=lifespan)
+def list_targets(enabled_only: bool = False):
+    with db_conn() as conn:
+        if enabled_only:
+            return conn.execute(
+                "SELECT * FROM watch_targets WHERE enabled=1 ORDER BY subject, course, class_number"
+            ).fetchall()
+        return conn.execute(
+            "SELECT * FROM watch_targets ORDER BY subject, course, class_number"
+        ).fetchall()
 
 
-CSS = """
+def set_target_result(target_id: int, status: str, section: str | None, alerted_open: int | None = None):
+    with db_conn() as conn:
+        if alerted_open is None:
+            conn.execute(
+                """
+                UPDATE watch_targets
+                SET last_status=?, last_section=?, last_checked_at=?
+                WHERE id=?
+                """,
+                (status, section, now_utc(), target_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE watch_targets
+                SET last_status=?, last_section=?, last_checked_at=?, alerted_open=?
+                WHERE id=?
+                """,
+                (status, section, now_utc(), alerted_open, target_id),
+            )
+        conn.commit()
+
+
+def new_quest_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    return s
+
+
+def ensure_quest_sessions(count: int) -> list[requests.Session]:
+    with quest_sessions_lock:
+        while len(quest_sessions) < count:
+            quest_sessions.append(new_quest_session())
+            log(f"Created Quest guest session #{len(quest_sessions)}")
+        return quest_sessions[:count]
+
+
+def get_form_state(session: requests.Session) -> dict[str, str]:
+    response = session.get(SEARCH_PAGE, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    data: dict[str, str] = {}
+
+    for element in soup.select("input[name], select[name]"):
+        name = element.get("name")
+        if not name:
+            continue
+        if element.name == "input":
+            input_type = element.get("type", "").lower()
+            if input_type in {"button", "submit"}:
+                continue
+            if input_type == "checkbox":
+                if element.has_attr("checked"):
+                    data[name] = element.get("value", "Y")
+                continue
+            data[name] = element.get("value", "")
+        elif element.name == "select":
+            selected = element.select_one("option[selected]")
+            if selected:
+                data[name] = selected.get("value", "")
+            else:
+                first = element.select_one("option")
+                if first:
+                    data[name] = first.get("value", "")
+    return data
+
+
+def extract_inner_html(raw: str) -> str:
+    parts = re.findall(
+        r"<FIELD\b[^>]*><!\[CDATA\[(.*?)\]\]></FIELD>",
+        raw,
+        flags=re.DOTALL,
+    )
+    return "\n".join(parts)
+
+
+def parse_results(raw: str) -> list[dict[str, str]]:
+    html = extract_inner_html(raw)
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[dict[str, str]] = []
+
+    for class_link in soup.select("a[id^='MTG_CLASS_NBR$']"):
+        class_number = class_link.get_text(strip=True)
+        suffix = class_link.get("id", "").split("$")[-1]
+        section_link = soup.find(id=f"MTG_CLASSNAME${suffix}")
+        status_container = soup.find(id=f"win0divDERIVED_CLSRCH_SSR_STATUS_LONG${suffix}")
+        section = " ".join(section_link.stripped_strings) if section_link else "Unknown"
+
+        # The user only wants real Regular sections, not Course Selection placeholders.
+        if "Regular" not in section:
+            continue
+
+        status = "Unknown"
+        if status_container:
+            status_img = status_container.find("img")
+            if status_img:
+                status = status_img.get("alt", "Unknown")
+
+        results.append(
+            {
+                "class_number": class_number,
+                "section": section,
+                "status": status.title(),
+            }
+        )
+    return results
+
+
+def search_course(
+    session: requests.Session, term_code: str, subject: str, course: str
+) -> tuple[list[dict[str, str]], int, float]:
+    data = get_form_state(session)
+    data["ICAJAX"] = "1"
+    data["CLASS_SRCH_WRK2_STRM$35$"] = term_code
+    data["SSR_CLSRCH_WRK_SUBJECT$0"] = subject.upper()
+    data["SSR_CLSRCH_WRK_SSR_EXACT_MATCH1$1"] = "E"
+    data["SSR_CLSRCH_WRK_CATALOG_NBR$1"] = str(course)
+    data["SSR_CLSRCH_WRK_SSR_OPEN_ONLY$chk$3"] = "N"
+    data["ICAction"] = "CLASS_SRCH_WRK2_SSR_PB_CLASS_SRCH"
+
+    started = time.monotonic()
+    response = session.post(
+        POST_URL,
+        data=data,
+        headers={
+            "Referer": SEARCH_PAGE,
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    elapsed = time.monotonic() - started
+    response.raise_for_status()
+    return parse_results(response.text), response.status_code, elapsed
+
+
+def send_telegram(subject: str, course: str, result: dict[str, str]) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram not configured; cannot send alert")
+        return False
+
+    message = (
+        f"🚨 {subject} {course} IS OPEN\n\n"
+        f"Class #: {result['class_number']}\n"
+        f"Section: {result['section']}\n"
+        f"Status: {result['status']}\n\n"
+        f"Open Quest: {QUEST_HOME}\n"
+        f"Use class number {result['class_number']} to enrol."
+    )
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        log(f"Telegram alert sent: {subject} {course}, class {result['class_number']}")
+        return True
+    except Exception as exc:
+        log(f"Telegram alert failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def process_course_search(
+    session: requests.Session,
+    course_key: tuple[str, str, str],
+    targets: list[sqlite3.Row],
+) -> None:
+    term_code, subject, course = course_key
+    try:
+        results, status_code, elapsed = search_course(session, term_code, subject, course)
+        log(f"HTTP {status_code} | {subject} {course} | {elapsed:.2f}s | {len(results)} Regular section(s)")
+        by_class = {r["class_number"]: r for r in results}
+
+        for target in targets:
+            result = by_class.get(str(target["class_number"]))
+            if result is None:
+                # Don't re-arm an alert just because a transient parse/search did not find it.
+                set_target_result(target["id"], "Not found", None, None)
+                log(f"  target class {target['class_number']} not found among Regular sections")
+                continue
+
+            status = result["status"]
+            log(f"  class {result['class_number']} | {result['section']} | {status}")
+
+            if status == "Open":
+                if not target["alerted_open"]:
+                    if send_telegram(subject, course, result):
+                        set_target_result(target["id"], status, result["section"], 1)
+                    else:
+                        set_target_result(target["id"], status, result["section"], 0)
+                else:
+                    set_target_result(target["id"], status, result["section"], 1)
+            elif status == "Closed":
+                # Re-arm so another future Open state produces a new ping.
+                set_target_result(target["id"], status, result["section"], 0)
+            else:
+                set_target_result(target["id"], status, result["section"], None)
+
+    except requests.exceptions.Timeout:
+        log(f"TIMEOUT | {subject} {course}")
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        log(f"HTTP ERROR {status} | {subject} {course} | {exc}")
+    except Exception as exc:
+        log(f"ERROR | {subject} {course} | {type(exc).__name__}: {exc}")
+
+
+def worker_run(
+    worker_index: int,
+    session: requests.Session,
+    assignments: list[tuple[tuple[str, str, str], list[sqlite3.Row]]],
+    cycle_start: float,
+) -> None:
+    if not assignments:
+        return
+    interval = CHECK_SECONDS / len(assignments)
+    for i, (course_key, targets) in enumerate(assignments):
+        target_time = cycle_start + i * interval
+        delay = target_time - time.monotonic()
+        if delay > 0 and stop_event.wait(delay):
+            return
+        process_course_search(session, course_key, targets)
+
+
+def build_assignments(rows: list[sqlite3.Row]):
+    grouped: "OrderedDict[tuple[str, str, str], list[sqlite3.Row]]" = OrderedDict()
+    for row in rows:
+        key = (row["term_code"], row["subject"], row["course"])
+        grouped.setdefault(key, []).append(row)
+
+    items = list(grouped.items())
+    if not items:
+        return []
+
+    session_count = math.ceil(len(items) / COURSES_PER_SESSION)
+    buckets: list[list] = [[] for _ in range(session_count)]
+    # Round-robin keeps the sessions balanced, e.g. 11 courses -> 6 + 5.
+    for i, item in enumerate(items):
+        buckets[i % session_count].append(item)
+    return buckets
+
+
+def scheduler_loop() -> None:
+    log("Background scheduler started")
+    while not stop_event.is_set():
+        cycle_start = time.monotonic()
+        rows = list_targets(enabled_only=True)
+        buckets = build_assignments(rows)
+
+        if not buckets:
+            if stop_event.wait(5):
+                return
+            continue
+
+        sessions = ensure_quest_sessions(len(buckets))
+        distinct_courses = sum(len(bucket) for bucket in buckets)
+        log(
+            f"Cycle: {distinct_courses} distinct course search(es), "
+            f"{len(buckets)} Quest session(s), {len(rows)} target class(es)"
+        )
+
+        threads: list[threading.Thread] = []
+        for idx, bucket in enumerate(buckets):
+            t = threading.Thread(
+                target=worker_run,
+                args=(idx, sessions[idx], bucket, cycle_start),
+                daemon=True,
+                name=f"quest-worker-{idx+1}",
+            )
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            while t.is_alive() and not stop_event.is_set():
+                t.join(timeout=0.5)
+
+        remaining = cycle_start + CHECK_SECONDS - time.monotonic()
+        if remaining > 0 and stop_event.wait(remaining):
+            return
+
+
+def status_badge(status: str | None) -> str:
+    if status == "Open":
+        return '<span class="badge open">OPEN</span>'
+    if status == "Closed":
+        return '<span class="badge closed">Closed</span>'
+    if status == "Not found":
+        return '<span class="badge warn">Not found</span>'
+    return '<span class="badge unknown">Waiting</span>'
+
+
+def page_html(message: str = "") -> str:
+    rows = list_targets(False)
+    telegram_state = "configured" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "NOT configured"
+    row_html = ""
+    for row in rows:
+        enabled = bool(row["enabled"])
+        row_html += f"""
+        <tr>
+          <td><strong>{escape(row['subject'])} {escape(row['course'])}</strong></td>
+          <td><code>{escape(row['class_number'])}</code></td>
+          <td>{escape(row['last_section'] or '—')}</td>
+          <td>{status_badge(row['last_status'])}</td>
+          <td>{escape(row['last_checked_at'] or 'Not checked yet')}</td>
+          <td>{'Watching' if enabled else 'Paused'}</td>
+          <td class="actions">
+            <form method="post" action="/targets/{row['id']}/toggle"><button class="secondary">{'Pause' if enabled else 'Resume'}</button></form>
+            <form method="post" action="/targets/{row['id']}/delete" onsubmit="return confirm('Delete this target?')"><button class="danger">Delete</button></form>
+          </td>
+        </tr>
+        """
+
+    if not row_html:
+        row_html = '<tr><td colspan="7" class="empty">No class numbers added yet.</td></tr>'
+
+    msg_html = f'<div class="message">{escape(message)}</div>' if message else ""
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>UW Course Watcher</title>
 <style>
-:root{font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#171717;background:#f7f7f8}
-*{box-sizing:border-box} body{margin:0}.wrap{max-width:1050px;margin:36px auto;padding:0 18px}.top{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:20px}
-h1{margin:0;font-size:30px} .muted{color:#666;font-size:14px}.card{background:white;border:1px solid #e6e6e8;border-radius:14px;padding:18px;margin-bottom:16px;box-shadow:0 1px 2px rgba(0,0,0,.03)}
-.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}.field label{display:block;font-size:12px;color:#555;margin-bottom:5px}.field input,.field select{width:100%;padding:10px;border:1px solid #d7d7da;border-radius:8px;background:white}
-button,.btn{border:0;border-radius:8px;padding:9px 12px;cursor:pointer;text-decoration:none;display:inline-block;font-weight:600}.primary{background:#111;color:white}.ghost{background:#efeff1;color:#222}.danger{background:#fff0f0;color:#a00}
-table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px 9px;border-bottom:1px solid #eee;font-size:14px}th{color:#666;font-size:12px}.status{font-weight:700}.open{color:#087a35}.full{color:#a11}.unknown{color:#777}.err{font-size:12px;color:#a11;max-width:300px}.actions{display:flex;gap:6px;flex-wrap:wrap}
-@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}.top{align-items:start;flex-direction:column}table{display:block;overflow-x:auto}}
+body {{ font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; margin:0; background:#f6f7f9; color:#171717; }}
+.wrap {{ max-width:1100px; margin:36px auto; padding:0 18px; }}
+.card {{ background:white; border:1px solid #e3e5e8; border-radius:14px; padding:22px; margin-bottom:18px; box-shadow:0 2px 8px rgba(0,0,0,.04); }}
+h1 {{ margin:0 0 6px; font-size:28px; }} .sub {{ color:#666; margin-bottom:18px; }}
+.grid {{ display:grid; grid-template-columns:1fr 1fr 1fr 1fr auto; gap:10px; align-items:end; }}
+label {{ font-size:13px; color:#555; display:block; margin-bottom:5px; }}
+input {{ width:100%; box-sizing:border-box; padding:10px 11px; border:1px solid #ccd0d5; border-radius:8px; font-size:15px; }}
+button {{ border:0; background:#111; color:white; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }}
+button.secondary {{ background:#eceff2; color:#222; }} button.danger {{ background:#b42318; }}
+table {{ width:100%; border-collapse:collapse; }} th,td {{ text-align:left; padding:11px 9px; border-bottom:1px solid #eee; vertical-align:middle; }} th {{ font-size:12px; color:#666; text-transform:uppercase; letter-spacing:.03em; }}
+.badge {{ display:inline-block; padding:4px 8px; border-radius:999px; font-size:12px; font-weight:700; }}
+.open {{ background:#d9fbe5; color:#087a35; }} .closed {{ background:#f3f4f6; color:#555; }} .warn {{ background:#fff0c2; color:#7a5600; }} .unknown {{ background:#e9eef8; color:#3b527b; }}
+.actions {{ display:flex; gap:7px; }} .actions form {{ margin:0; }} .message {{ padding:10px 12px; background:#eaf4ff; border-radius:8px; margin-bottom:12px; }} .empty {{ color:#777; text-align:center; padding:30px; }}
+.meta {{ display:flex; flex-wrap:wrap; gap:10px 18px; font-size:13px; color:#666; }} code {{ background:#f2f3f5; padding:2px 5px; border-radius:5px; }}
+@media(max-width:780px) {{ .grid {{ grid-template-columns:1fr 1fr; }} table {{ font-size:13px; }} .wrap {{ margin-top:18px; }} }}
 </style>
-"""
-
-
-def esc(v):
-    return html.escape("" if v is None else str(v))
-
-
-def course_status(row):
-    if row["last_error"]:
-        return '<span class="status unknown">⚠ Error</span>'
-    if row["available_seats"] is None:
-        return '<span class="status unknown">● Waiting</span>'
-    if row["available_seats"] > 0:
-        return f'<span class="status open">● {row["available_seats"]} open</span>'
-    return '<span class="status full">● Full</span>'
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>UW Course Watcher</h1>
+    <div class="sub">Add the exact Quest class number you want. The watcher pings Telegram whenever that Regular section is Open.</div>
+    {msg_html}
+    <form method="post" action="/targets" class="grid">
+      <div><label>Term code</label><input name="term_code" value="{escape(DEFAULT_TERM_CODE)}" required></div>
+      <div><label>Subject</label><input name="subject" placeholder="BET" required></div>
+      <div><label>Course</label><input name="course" placeholder="405" required></div>
+      <div><label>Exact Class #</label><input name="class_number" placeholder="12345" required></div>
+      <div><button type="submit">Add class</button></div>
+    </form>
+    <div class="meta" style="margin-top:16px">
+      <span>Cycle: <strong>{CHECK_SECONDS}s</strong></span>
+      <span>Up to <strong>{COURSES_PER_SESSION}</strong> distinct courses per Quest session</span>
+      <span>Telegram: <strong>{telegram_state}</strong></span>
+      <span>Database: <code>{escape(str(DB_PATH))}</code></span>
+    </div>
+    <form method="post" action="/test-telegram" style="margin-top:14px"><button class="secondary" type="submit">Send test Telegram</button></form>
+  </div>
+  <div class="card" style="overflow-x:auto">
+    <table>
+      <thead><tr><th>Course</th><th>Class #</th><th>Section</th><th>Status</th><th>Last checked</th><th>Watcher</th><th></th></tr></thead>
+      <tbody>{row_html}</tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>"""
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    with db_conn() as conn:
-        rows = conn.execute("SELECT * FROM courses ORDER BY id DESC").fetchall()
-
-    table_rows = ""
-    for r in rows:
-        target = r["class_number"] or r["section"] or "Any"
-        reserve = "Yes" if r["reserve_present"] else ("No" if r["reserve_present"] == 0 else "—")
-        table_rows += f"""
-        <tr>
-          <td><b>{esc(r['subject'])} {esc(r['course'])}</b><br><span class='muted'>{esc(r['term'])}</span></td>
-          <td>{esc(target)}</td><td>{course_status(r)}</td>
-          <td>{esc(r['enrolled']) if r['enrolled'] is not None else '—'} / {esc(r['capacity']) if r['capacity'] is not None else '—'}</td>
-          <td>{reserve}</td><td>{esc(r['last_checked'] or 'Not checked yet')}</td>
-          <td><div class='actions'>
-            <form method='post' action='/courses/{r['id']}/toggle'><button class='ghost'>{'Pause' if r['enabled'] else 'Resume'}</button></form>
-            <form method='post' action='/courses/{r['id']}/delete' onsubmit="return confirm('Delete this watcher?')"><button class='danger'>Delete</button></form>
-          </div>{f"<div class='err'>{esc(r['last_error'])}</div>" if r['last_error'] else ''}</td>
-        </tr>"""
-
-    if not table_rows:
-        table_rows = "<tr><td colspan='7' class='muted'>No courses yet. Add one below.</td></tr>"
-
-    telegram_state = "configured" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "not configured"
-    body = f"""<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>{CSS}<meta http-equiv='refresh' content='20'></head><body><div class='wrap'>
-      <div class='top'><div><h1>UW Course Watcher</h1><div class='muted'>Parallel Quest checks every {CHECK_SECONDS}s · concurrency {MAX_CONCURRENCY} · Telegram {telegram_state}</div></div>
-      <div class='muted'>Cycle: {esc(runtime['last_cycle_started'] or 'starting…')}</div></div>
-      <div class='card'><table><thead><tr><th>Course</th><th>Class / section</th><th>Status</th><th>Enrolled / cap</th><th>Reserve</th><th>Last checked</th><th></th></tr></thead><tbody>{table_rows}</tbody></table></div>
-      <div class='card'><h2 style='margin-top:0'>Add course</h2>
-      <form method='post' action='/courses'><div class='grid'>
-        <div class='field'><label>Term</label><input name='term' value='Fall 2026' required></div>
-        <div class='field'><label>Subject</label><input name='subject' placeholder='CS' required></div>
-        <div class='field'><label>Course</label><input name='course' placeholder='349' required></div>
-        <div class='field'><label>Class # (recommended)</label><input name='class_number' placeholder='12345'></div>
-        <div class='field'><label>Section (optional)</label><input name='section' placeholder='LEC 001'></div>
-        <div class='field'><label>Career</label><select name='career'><option>Undergraduate</option><option>Graduate</option></select></div>
-      </div><div style='margin-top:12px'><button class='primary'>+ Start watching</button></div></form></div>
-      <div class='muted'>Tip: use the exact Quest Class Number whenever possible. The watcher reports reserve capacity but cannot determine your personal eligibility for a reserved seat.</div>
-    </div></body></html>"""
-    return HTMLResponse(body)
+def dashboard(request: Request, message: str = ""):
+    return HTMLResponse(page_html(message))
 
 
-@app.post("/courses")
-async def add_course(
-    term: str = Form(...), subject: str = Form(...), course: str = Form(...),
-    class_number: str = Form(""), section: str = Form(""), career: str = Form("Undergraduate")
+@app.post("/targets")
+def add_target(
+    term_code: str = Form(...),
+    subject: str = Form(...),
+    course: str = Form(...),
+    class_number: str = Form(...),
 ):
-    term = term.strip()
+    term_code = term_code.strip()
     subject = subject.strip().upper()
     course = course.strip().upper()
     class_number = class_number.strip()
-    section = section.strip().upper()
-    if not (term and subject and course):
-        return JSONResponse({"error": "term, subject and course are required"}, status_code=400)
+    if not term_code or not subject or not course or not class_number:
+        return RedirectResponse("/?message=All+fields+are+required", status_code=303)
+    try:
+        with db_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO watch_targets
+                (term_code, subject, course, class_number, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (term_code, subject, course, class_number, now_utc()),
+            )
+            conn.commit()
+        return RedirectResponse("/?message=Class+added", status_code=303)
+    except sqlite3.IntegrityError:
+        return RedirectResponse("/?message=That+class+is+already+being+watched", status_code=303)
+
+
+@app.post("/targets/{target_id}/toggle")
+def toggle_target(target_id: int):
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO courses(term,subject,course,class_number,section,career) VALUES(?,?,?,?,?,?)",
-            (term, subject, course, class_number, section, career.strip() or "Undergraduate"),
+            "UPDATE watch_targets SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?",
+            (target_id,),
         )
         conn.commit()
     return RedirectResponse("/", status_code=303)
 
 
-@app.post("/courses/{course_id}/toggle")
-async def toggle_course(course_id: int):
+@app.post("/targets/{target_id}/delete")
+def delete_target(target_id: int):
     with db_conn() as conn:
-        conn.execute("UPDATE courses SET enabled = CASE enabled WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (course_id,))
+        conn.execute("DELETE FROM watch_targets WHERE id=?", (target_id,))
         conn.commit()
     return RedirectResponse("/", status_code=303)
 
 
-@app.post("/courses/{course_id}/delete")
-async def delete_course(course_id: int):
-    with db_conn() as conn:
-        conn.execute("DELETE FROM courses WHERE id=?", (course_id,))
-        conn.commit()
-    return RedirectResponse("/", status_code=303)
+@app.post("/test-telegram")
+def test_telegram():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return RedirectResponse("/?message=Telegram+is+not+configured", status_code=303)
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": "✅ UW Course Watcher Telegram test succeeded."},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return RedirectResponse("/?message=Test+Telegram+sent", status_code=303)
+    except Exception as exc:
+        return RedirectResponse(f"/?message=Telegram+test+failed%3A+{type(exc).__name__}", status_code=303)
 
 
 @app.get("/health")
-async def health():
-    return {"ok": True, "last_cycle_started": runtime["last_cycle_started"], "last_cycle_finished": runtime["last_cycle_finished"]}
+def health():
+    return {
+        "ok": True,
+        "check_seconds": CHECK_SECONDS,
+        "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+    }
+
+
+@app.on_event("startup")
+def startup_event():
+    global scheduler_thread
+    init_db()
+    stop_event.clear()
+    scheduler_thread = threading.Thread(target=scheduler_loop, daemon=True, name="quest-scheduler")
+    scheduler_thread.start()
+    log("UW Course Watcher started")
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    stop_event.set()
+    log("UW Course Watcher stopping")
