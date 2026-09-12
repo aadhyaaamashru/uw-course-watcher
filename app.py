@@ -236,42 +236,100 @@ async def dump_quest_diagnostics(page, course):
     print("=== END QUEST DIAGNOSTICS ===\n", flush=True)
 
 
-async def perform_search(page, course):
-    roots = [page] + page.frames
-    root = page
-    for candidate in roots:
+async def get_quest_search_frame(page):
+    """Return the PeopleSoft frame that contains the real public class-search form."""
+    # Waterloo Quest renders the public search form inside this PeopleSoft frame.
+    for frame in page.frames:
+        if "UW_CLASS_SRCH.GBL" in frame.url:
+            try:
+                if await frame.locator('#SSR_CLSRCH_WRK_SUBJECT\$0').count():
+                    return frame
+            except Exception:
+                pass
+
+    # Fallback: identify the frame by the actual stable PeopleSoft controls.
+    for frame in page.frames:
         try:
-            body = normalize(await candidate.locator("body").inner_text(timeout=2500))
-            if re.search(r"\bSubject\b", body, re.I) and re.search(r"Course Number", body, re.I):
-                root = candidate
-                break
+            if (
+                await frame.locator('#SSR_CLSRCH_WRK_SUBJECT\$0').count()
+                and await frame.locator('#SSR_CLSRCH_WRK_CATALOG_NBR\$1').count()
+            ):
+                return frame
+        except Exception:
+            pass
+    return None
+
+
+async def select_option_by_text(locator, wanted):
+    wanted = wanted.strip().lower()
+    options = locator.locator("option")
+    for i in range(await options.count()):
+        opt = options.nth(i)
+        txt = normalize(await opt.inner_text())
+        # PeopleSoft sometimes includes bidi control characters in option labels.
+        txt_clean = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", txt).strip()
+        if wanted == txt_clean.lower() or wanted in txt_clean.lower():
+            await locator.select_option(index=i)
+            return True
+    return False
+
+
+async def perform_search(page, course):
+    root = await get_quest_search_frame(page)
+    if root is None:
+        await dump_quest_diagnostics(page, course)
+        raise RuntimeError("Could not find the Quest class-search frame.")
+
+    # Use the exact PeopleSoft controls observed on Waterloo's live public Quest page.
+    term = root.locator('#CLASS_SRCH_WRK2_STRM\$35\$')
+    subject = root.locator('#SSR_CLSRCH_WRK_SUBJECT\$0')
+    match_mode = root.locator('#SSR_CLSRCH_WRK_SSR_EXACT_MATCH1\$1')
+    catalog = root.locator('#SSR_CLSRCH_WRK_CATALOG_NBR\$1')
+    career = root.locator('#SSR_CLSRCH_WRK_ACAD_CAREER\$2')
+    open_only = root.locator('#SSR_CLSRCH_WRK_SSR_OPEN_ONLY\$3')
+    search_btn = root.locator('#CLASS_SRCH_WRK2_SSR_PB_CLASS_SRCH')
+
+    if not await term.count() or not await subject.count() or not await catalog.count():
+        await dump_quest_diagnostics(page, course)
+        raise RuntimeError("Quest search controls were not found in the expected frame.")
+
+    if not await select_option_by_text(term, course["term"]):
+        raise RuntimeError(f"Could not select term {course['term']!r} in Quest.")
+
+    await subject.fill(course["subject"])
+
+    # Force an exact course-number match, then fill the *actual* catalog-number input.
+    # The visible 'Course Number' label points at the comparator select, not this input,
+    # which is why the previous generic label-based code failed.
+    if await match_mode.count():
+        try:
+            await match_mode.select_option(label="is exactly")
+        except Exception:
+            await select_option_by_text(match_mode, "is exactly")
+    await catalog.fill(course["course"])
+
+    if await career.count():
+        if not await select_option_by_text(career, course["career"]):
+            # Career is useful but not required to submit the search.
+            print(f"Warning: could not select career {course['career']!r}; continuing.", flush=True)
+
+    if await open_only.count():
+        try:
+            if await open_only.is_checked():
+                await open_only.uncheck()
         except Exception:
             pass
 
-    await choose_term(root, course["term"])
-    if not await set_field(root, [r"^Subject$", r"Subject"], course["subject"]):
-        raise RuntimeError("Could not find Subject field.")
-    if not await set_field(root, [r"Course Number", r"Catalog Number", r"Course Nbr"], course["course"]):
-        await dump_quest_diagnostics(page, course)
-        raise RuntimeError("Could not find Course Number field. Diagnostics printed above.")
-    await set_field(root, [r"Course Career", r"Career"], course["career"])
+    if not await search_btn.count():
+        raise RuntimeError("Could not find Quest Search button.")
 
-    try:
-        cb = root.get_by_label(re.compile(r"Show Open Classes Only", re.I))
-        item = await first_visible(cb)
-        if item and await item.is_checked():
-            await item.uncheck()
-    except Exception:
-        pass
+    await search_btn.click()
+    # PeopleSoft performs a postback inside the frame. Give it time to replace the content.
+    await page.wait_for_timeout(3500)
 
-    item = await first_visible(root.get_by_role("button", name=re.compile(r"^Search$", re.I)))
-    if not item:
-        item = await first_visible(root.locator('input[type="submit"][value*="Search" i]'))
-    if not item:
-        raise RuntimeError("Could not find Search button.")
-    await item.click()
-    await root.wait_for_timeout(2200)
-    return root
+    # Re-resolve the frame after the postback in case PeopleSoft replaced it.
+    result_root = await get_quest_search_frame(page)
+    return result_root or root
 
 
 async def open_target_class(root, course):
