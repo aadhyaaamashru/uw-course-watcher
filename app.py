@@ -4,6 +4,9 @@ import asyncio
 import sqlite3
 import smtplib
 import html
+import json
+import urllib.parse
+import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime
 from email.message import EmailMessage
@@ -178,6 +181,61 @@ async def enter_public_quest(page):
         raise RuntimeError("Quest redirected the public browser session to sign-in.")
 
 
+async def dump_quest_diagnostics(page, course):
+    print(f"\n=== QUEST DIAGNOSTICS: {course['subject']} {course['course']} ===", flush=True)
+    try:
+        print(f"PAGE URL: {page.url}", flush=True)
+        print(f"PAGE TITLE: {await page.title()}", flush=True)
+    except Exception as exc:
+        print(f"PAGE META ERROR: {exc}", flush=True)
+
+    frames = page.frames
+    print(f"FRAME COUNT: {len(frames)}", flush=True)
+    for idx, frame in enumerate(frames):
+        try:
+            print(f"FRAME[{idx}] name={frame.name!r} url={frame.url}", flush=True)
+            inputs = frame.locator("input, select, textarea, button")
+            count = min(await inputs.count(), 120)
+            print(f"FRAME[{idx}] controls={count}", flush=True)
+            for i in range(count):
+                el = inputs.nth(i)
+                try:
+                    info = await el.evaluate("""el => ({
+                        tag: el.tagName,
+                        type: el.getAttribute('type'),
+                        id: el.id,
+                        name: el.getAttribute('name'),
+                        value: el.value,
+                        placeholder: el.getAttribute('placeholder'),
+                        aria: el.getAttribute('aria-label'),
+                        title: el.getAttribute('title'),
+                        text: (el.innerText || '').trim().slice(0,120),
+                        visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                    })""")
+                    print(f"  CONTROL[{i}] {info}", flush=True)
+                except Exception as exc:
+                    print(f"  CONTROL[{i}] <inspect error: {exc}>", flush=True)
+
+            labels = frame.locator("label")
+            lcount = min(await labels.count(), 80)
+            for i in range(lcount):
+                lab = labels.nth(i)
+                try:
+                    txt = normalize(await lab.inner_text())
+                    target = await lab.get_attribute("for")
+                    if txt:
+                        print(f"  LABEL[{i}] text={txt!r} for={target!r}", flush=True)
+                except Exception:
+                    pass
+
+            body_text = normalize(await frame.locator("body").inner_text(timeout=3000))
+            print(f"FRAME[{idx}] BODY PREVIEW: {body_text[:2500]}", flush=True)
+        except Exception as exc:
+            print(f"FRAME[{idx}] INSPECTION ERROR: {exc}", flush=True)
+
+    print("=== END QUEST DIAGNOSTICS ===\n", flush=True)
+
+
 async def perform_search(page, course):
     roots = [page] + page.frames
     root = page
@@ -194,7 +252,8 @@ async def perform_search(page, course):
     if not await set_field(root, [r"^Subject$", r"Subject"], course["subject"]):
         raise RuntimeError("Could not find Subject field.")
     if not await set_field(root, [r"Course Number", r"Catalog Number", r"Course Nbr"], course["course"]):
-        raise RuntimeError("Could not find Course Number field.")
+        await dump_quest_diagnostics(page, course)
+        raise RuntimeError("Could not find Course Number field. Diagnostics printed above.")
     await set_field(root, [r"Course Career", r"Career"], course["career"])
 
     try:
@@ -301,9 +360,11 @@ async def check_course(course, browser, semaphore):
         except Exception:
             if SCREENSHOT_ON_ERROR:
                 try:
-                    await page.screenshot(path=f"/data/error-course-{course['id']}.png", full_page=True)
-                except Exception:
-                    pass
+                    shot = f"/data/error-course-{course['id']}.png"
+                    await page.screenshot(path=shot, full_page=True)
+                    print(f"Saved Quest error screenshot: {shot}", flush=True)
+                except Exception as shot_exc:
+                    print(f"Could not save Quest error screenshot: {shot_exc}", flush=True)
             raise
         finally:
             await context.close()
