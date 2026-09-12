@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+/data/
+watcher.db
+error-course-*.png
