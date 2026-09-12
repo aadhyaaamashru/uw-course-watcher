@@ -237,23 +237,21 @@ async def dump_quest_diagnostics(page, course):
 
 
 async def get_quest_search_frame(page):
-    """Return the PeopleSoft frame that contains the real public class-search form."""
-    # Waterloo Quest renders the public search form inside this PeopleSoft frame.
+    """Return the stable PeopleSoft main frame used for both search and results."""
+    # The live Quest diagnostics showed the public search/results content in this frame.
+    for frame in page.frames:
+        if frame.name == "main_target_win0":
+            return frame
+
+    # Fallback to the Waterloo public class-search component URL.
     for frame in page.frames:
         if "UW_CLASS_SRCH.GBL" in frame.url:
-            try:
-                if await frame.locator('#SSR_CLSRCH_WRK_SUBJECT\$0').count():
-                    return frame
-            except Exception:
-                pass
+            return frame
 
-    # Fallback: identify the frame by the actual stable PeopleSoft controls.
+    # Last fallback: find the frame containing the actual Subject control.
     for frame in page.frames:
         try:
-            if (
-                await frame.locator('#SSR_CLSRCH_WRK_SUBJECT\$0').count()
-                and await frame.locator('#SSR_CLSRCH_WRK_CATALOG_NBR\$1').count()
-            ):
+            if await frame.locator('[id="SSR_CLSRCH_WRK_SUBJECT$0"]').count():
                 return frame
         except Exception:
             pass
@@ -281,12 +279,12 @@ async def perform_search(page, course):
         raise RuntimeError("Could not find the Quest class-search frame.")
 
     # Use the exact PeopleSoft controls observed on Waterloo's live public Quest page.
-    term = root.locator('#CLASS_SRCH_WRK2_STRM\$35\$')
-    subject = root.locator('#SSR_CLSRCH_WRK_SUBJECT\$0')
-    match_mode = root.locator('#SSR_CLSRCH_WRK_SSR_EXACT_MATCH1\$1')
-    catalog = root.locator('#SSR_CLSRCH_WRK_CATALOG_NBR\$1')
-    career = root.locator('#SSR_CLSRCH_WRK_ACAD_CAREER\$2')
-    open_only = root.locator('#SSR_CLSRCH_WRK_SSR_OPEN_ONLY\$3')
+    term = root.locator('[id="CLASS_SRCH_WRK2_STRM$35$"]')
+    subject = root.locator('[id="SSR_CLSRCH_WRK_SUBJECT$0"]')
+    match_mode = root.locator('[id="SSR_CLSRCH_WRK_SSR_EXACT_MATCH1$1"]')
+    catalog = root.locator('[id="SSR_CLSRCH_WRK_CATALOG_NBR$1"]')
+    career = root.locator('[id="SSR_CLSRCH_WRK_ACAD_CAREER$2"]')
+    open_only = root.locator('[id="SSR_CLSRCH_WRK_SSR_OPEN_ONLY$3"]')
     search_btn = root.locator('#CLASS_SRCH_WRK2_SSR_PB_CLASS_SRCH')
 
     if not await term.count() or not await subject.count() or not await catalog.count():
@@ -323,20 +321,31 @@ async def perform_search(page, course):
     if not await search_btn.count():
         raise RuntimeError("Could not find Quest Search button.")
 
+    before_text = normalize(await root.locator("body").inner_text())
     await search_btn.click()
-    # PeopleSoft performs a postback inside the frame. Give it time to replace the content.
-    await page.wait_for_timeout(3500)
 
-    # Re-resolve the frame after the postback in case PeopleSoft replaced it.
-    result_root = await get_quest_search_frame(page)
-    return result_root or root
+    # PeopleSoft posts back inside main_target_win0. Wait for the frame body to actually
+    # change rather than sleeping a fixed amount and assuming results are ready.
+    result_root = await get_quest_search_frame(page) or root
+    for _ in range(30):  # up to ~15 seconds
+        await page.wait_for_timeout(500)
+        try:
+            current = normalize(await result_root.locator("body").inner_text())
+        except Exception:
+            result_root = await get_quest_search_frame(page) or root
+            continue
+        if current and current != before_text and len(current) > 80:
+            break
+
+    return await get_quest_search_frame(page) or result_root
 
 
 async def open_target_class(root, course):
     body_text = normalize(await root.locator("body").inner_text())
-    if course["subject"] not in body_text.upper() or course["course"] not in body_text.upper():
-        raise RuntimeError(f"Results do not appear to contain {course['subject']} {course['course']}.")
 
+    # Prefer the exact class number/section supplied by the user. Quest result pages do
+    # not always repeat the subject + catalog number as one literal string, so rejecting
+    # the page based on that text caused false failures.
     if course["class_number"]:
         links = root.get_by_role("link", name=re.compile(rf"\b{re.escape(course['class_number'])}\b"))
         item = await first_visible(links)
