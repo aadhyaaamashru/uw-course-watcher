@@ -1,0 +1,13 @@
+services:
+  watcher:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - watcher-data:/data
+
+volumes:
+  watcher-data:
